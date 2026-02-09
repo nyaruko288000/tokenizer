@@ -107,7 +107,7 @@ jobs:
             --vocab-size $VOCAB_SIZE
 
       - name: Upload tokenizer artifact
-        uses: actions/upload-artifact@v4
+        uses: dtolnay/rust-toolchain@stable
         with:
           name: hf-tokenizer-${{ github.event.inputs.vocab_size || '8192' }}
           path: tokenizer_output/
