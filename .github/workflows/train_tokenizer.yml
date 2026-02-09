@@ -1,0 +1,120 @@
+name: Train Tokenizer
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      vocab_size:
+        description: 'Vocabulary size'
+        required: false
+        default: '8192'
+      corpus_size_mb:
+        description: 'Corpus size to use (MB)'
+        required: false
+        default: '500'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 安装 mimalloc
+      - name: Install mimalloc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmimalloc-dev libmimalloc2.0
+          # 验证安装
+          ls -la /usr/lib/x86_64-linux-gnu/libmimalloc.so* || true
+          dpkg -L libmimalloc2.0 | grep ".so"
+
+      # 创建内存盘 (GitHub Actions runner 有 7GB RAM，分配 3GB 给 ramdisk)
+      - name: Setup RAM disk
+        run: |
+          sudo mkdir -p /mnt/ramdisk
+          sudo mount -t tmpfs -o size=3G tmpfs /mnt/ramdisk
+          df -h /mnt/ramdisk
+
+      # 安装 Python 依赖
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install gdown tokenizers transformers tqdm
+
+      # 从 Google Drive 下载语料
+      - name: Download corpus from Google Drive
+        run: |
+          cd /mnt/ramdisk
+          # 提取文件ID
+          FILE_ID="1uCexAXhCekAyTVCubvr0NtuliRlg7SBS"
+          gdown --id "$FILE_ID" -O corpus_full.txt --fuzzy || \
+          gdown "https://drive.google.com/uc?id=$FILE_ID" -O corpus_full.txt
+          ls -lh corpus_full.txt
+
+      # 截取 500MB 语料
+      - name: Extract 500MB corpus
+        run: |
+          cd /mnt/ramdisk
+          CORPUS_SIZE_MB=${{ github.event.inputs.corpus_size_mb || '500' }}
+          CORPUS_SIZE_BYTES=$((CORPUS_SIZE_MB * 1024 * 1024))
+          
+          echo "Extracting ${CORPUS_SIZE_MB}MB from corpus..."
+          head -c "$CORPUS_SIZE_BYTES" corpus_full.txt > corpus_500mb.txt
+          
+          # 删除原始大文件释放内存
+          rm corpus_full.txt
+          
+          ls -lh corpus_500mb.txt
+          wc -l corpus_500mb.txt
+
+      # 使用 mimalloc 训练分词器
+      - name: Train tokenizer with mimalloc
+        env:
+          LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libmimalloc.so
+          MIMALLOC_LARGE_OS_PAGES: 1
+          VOCAB_SIZE: ${{ github.event.inputs.vocab_size || '8192' }}
+        run: |
+          echo "Training with mimalloc preloaded..."
+          echo "LD_PRELOAD=$LD_PRELOAD"
+          
+          python train_tokenizer.py \
+            --corpus /mnt/ramdisk/corpus_500mb.txt \
+            --output /mnt/ramdisk/tokenizer_output \
+            --vocab-size $VOCAB_SIZE
+
+      # 复制结果到工作目录
+      - name: Copy results
+        run: |
+          cp -r /mnt/ramdisk/tokenizer_output ./tokenizer_output
+          ls -la ./tokenizer_output/
+
+      # 上传训练好的分词器
+      - name: Upload tokenizer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-tokenizer-${{ github.event.inputs.vocab_size || '8192' }}
+          path: tokenizer_output/
+          retention-days: 30
+
+      # 可选：直接推送到 Hugging Face Hub
+      # - name: Push to Hugging Face Hub
+      #   env:
+      #     HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      #   run: |
+      #     pip install huggingface_hub
+      #     python -c "
+      #     from huggingface_hub import HfApi
+      #     api = HfApi()
+      #     api.upload_folder(
+      #         folder_path='./tokenizer_output',
+      #         repo_id='your-username/your-tokenizer',
+      #         repo_type='model',
+      #         token='$HF_TOKEN'
+      #     )
+      #     "
