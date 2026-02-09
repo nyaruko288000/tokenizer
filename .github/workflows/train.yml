@@ -1,0 +1,273 @@
+name: Train Tokenizer & Convert Corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      vocab_size:
+        description: 'Vocabulary size'
+        required: false
+        default: '8192'
+      train_size_mb:
+        description: 'Training corpus size (MB)'
+        required: false
+        default: '500'
+
+env:
+  CARGO_TERM_COLOR: always
+  HF_REPO: Nyaruko2019/IMU1
+
+jobs:
+  train-and-convert:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ═══════════════════════════════════════════════════════════════════
+      # 环境准备
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmimalloc2.0 libmimalloc-dev python3-pip
+          pip3 install gdown huggingface_hub
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binaries
+        run: |
+          RUSTFLAGS="-C target-cpu=native" cargo build --release
+          ls -lh target/release/train target/release/convert
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 下载语料
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Download training corpus (3GB)
+        run: |
+          echo "Downloading main corpus..."
+          gdown --fuzzy "https://drive.google.com/file/d/1uCexAXhCekAyTVCubvr0NtuliRlg7SBS/view?usp=drivesdk" -O corpus_full.txt
+          ls -lh corpus_full.txt
+          
+          # 统计信息
+          echo "Corpus statistics:"
+          wc -l corpus_full.txt
+          head -c 1000 corpus_full.txt
+
+      - name: Download validation set
+        run: |
+          echo "Downloading validation set..."
+          gdown --fuzzy "https://drive.google.com/file/d/1o4TLwA9xSb5xrmLOS1C_RefdJJ0tXhmc/view?usp=drivesdk" -O valid.txt
+          ls -lh valid.txt
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 截取训练语料
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Extract training subset (${{ github.event.inputs.train_size_mb }}MB)
+        run: |
+          TRAIN_SIZE_MB=${{ github.event.inputs.train_size_mb || '500' }}
+          TRAIN_SIZE_BYTES=$((TRAIN_SIZE_MB * 1024 * 1024))
+          
+          echo "Extracting ${TRAIN_SIZE_MB}MB for training..."
+          head -c $TRAIN_SIZE_BYTES corpus_full.txt > corpus_train.txt
+          
+          # 确保最后一行完整
+          # 找到最后一个换行符位置，截断到那里
+          python3 << 'EOF'
+          with open('corpus_train.txt', 'rb') as f:
+              data = f.read()
+          
+          # 找最后一个换行符
+          last_newline = data.rfind(b'\n')
+          if last_newline > 0:
+              data = data[:last_newline + 1]
+          
+          with open('corpus_train.txt', 'wb') as f:
+              f.write(data)
+          
+          print(f"Training corpus: {len(data) / 1024 / 1024:.2f} MB")
+          EOF
+          
+          ls -lh corpus_train.txt
+          wc -l corpus_train.txt
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 训练分词器 (使用 mimalloc)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Train tokenizer
+        run: |
+          echo "Training tokenizer with mimalloc..."
+          
+          # 找到 mimalloc 库路径
+          MIMALLOC_PATH=$(find /usr -name "libmimalloc.so*" 2>/dev/null | head -1)
+          if [ -z "$MIMALLOC_PATH" ]; then
+            MIMALLOC_PATH=$(find /usr -name "libmimalloc.so.2.0" 2>/dev/null | head -1)
+          fi
+          echo "Using mimalloc: $MIMALLOC_PATH"
+          
+          # 使用 LD_PRELOAD 外挂 mimalloc
+          LD_PRELOAD=$MIMALLOC_PATH \
+          MIMALLOC_VERBOSE=1 \
+          ./target/release/train \
+            corpus_train.txt \
+            tokenizer.json \
+            ${{ github.event.inputs.vocab_size || '8192' }}
+          
+          ls -lh tokenizer.json
+          
+          # 显示分词器信息
+          echo "Tokenizer preview:"
+          head -c 2000 tokenizer.json
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 转换语料
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Convert full corpus (3GB)
+        run: |
+          echo "Converting full corpus..."
+          
+          MIMALLOC_PATH=$(find /usr -name "libmimalloc.so*" 2>/dev/null | head -1)
+          
+          LD_PRELOAD=$MIMALLOC_PATH \
+          ./target/release/convert \
+            tokenizer.json \
+            corpus_full.txt \
+            train.bin \
+            10000
+          
+          ls -lh train.bin
+
+      - name: Convert validation set
+        run: |
+          echo "Converting validation set..."
+          
+          MIMALLOC_PATH=$(find /usr -name "libmimalloc.so*" 2>/dev/null | head -1)
+          
+          LD_PRELOAD=$MIMALLOC_PATH \
+          ./target/release/convert \
+            tokenizer.json \
+            valid.txt \
+            valid.bin \
+            5000
+          
+          ls -lh valid.bin
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 打包分词器作为产物
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Package tokenizer artifact
+        run: |
+          mkdir -p artifacts
+          cp tokenizer.json artifacts/
+          
+          # 创建元信息
+          cat > artifacts/metadata.json << EOF
+          {
+            "vocab_size": ${{ github.event.inputs.vocab_size || '8192' }},
+            "train_size_mb": ${{ github.event.inputs.train_size_mb || '500' }},
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+          
+          # 压缩
+          tar -czvf tokenizer-artifact.tar.gz -C artifacts .
+          ls -lh tokenizer-artifact.tar.gz
+
+      - name: Upload tokenizer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-${{ github.run_number }}
+          path: |
+            tokenizer.json
+            artifacts/metadata.json
+          retention-days: 90
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 上传到 HuggingFace
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Upload to HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          echo "Uploading to HuggingFace: ${{ env.HF_REPO }}"
+          
+          python3 << 'EOF'
+          import os
+          from huggingface_hub import HfApi, login
+          
+          # 登录
+          token = os.environ.get("HF_TOKEN")
+          if not token:
+              raise ValueError("HF_TOKEN not set!")
+          
+          login(token=token)
+          api = HfApi()
+          
+          repo_id = os.environ.get("HF_REPO", "Nyaruko2019/IMU1")
+          
+          # 上传文件列表
+          files_to_upload = [
+              ("tokenizer.json", "tokenizer.json"),
+              ("train.bin", "train.bin"),
+              ("valid.bin", "valid.bin"),
+              ("corpus_full.txt", "corpus.txt"),
+              ("valid.txt", "valid.txt"),
+          ]
+          
+          for local_path, repo_path in files_to_upload:
+              if os.path.exists(local_path):
+                  size_mb = os.path.getsize(local_path) / 1024 / 1024
+                  print(f"Uploading {local_path} ({size_mb:.2f} MB) -> {repo_path}")
+                  
+                  api.upload_file(
+                      path_or_fileobj=local_path,
+                      path_in_repo=repo_path,
+                      repo_id=repo_id,
+                      repo_type="dataset",
+                  )
+                  print(f"  ✓ Uploaded {repo_path}")
+              else:
+                  print(f"  ✗ File not found: {local_path}")
+          
+          print("\n" + "="*60)
+          print(f"All files uploaded to: https://huggingface.co/datasets/{repo_id}")
+          print("="*60)
+          EOF
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 最终报告
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Summary
+        run: |
+          echo "## 🎉 Training Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files Generated" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| tokenizer.json | $(ls -lh tokenizer.json | awk '{print $5}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| train.bin | $(ls -lh train.bin | awk '{print $5}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| valid.bin | $(ls -lh valid.bin | awk '{print $5}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| corpus.txt | $(ls -lh corpus_full.txt | awk '{print $5}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| valid.txt | $(ls -lh valid.txt | awk '{print $5}') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- Vocab Size: **${{ github.event.inputs.vocab_size || '8192' }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Training Corpus: **${{ github.event.inputs.train_size_mb || '500' }} MB**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Links" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 [HuggingFace Dataset](https://huggingface.co/datasets/${{ env.HF_REPO }})" >> $GITHUB_STEP_SUMMARY
